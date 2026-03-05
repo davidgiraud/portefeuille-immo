@@ -123,6 +123,107 @@ def generate_visualizations(df: pd.DataFrame, num_buildings: int) -> tuple:
 
     return fig1, fig2
 
+
+# ---- Fonctions pour l'analyse de sensibilité (TRI / IRR) ----
+
+def calculate_irr(cash_flows, max_iter=1000, tol=1e-8):
+    """
+    Calcule le TRI (Taux de Rendement Interne) par la méthode de Newton-Raphson.
+
+    Le TRI est le taux annuel qui rend la VAN (Valeur Actuelle Nette) égale à zéro.
+    En pratique : c'est le rendement annualisé de votre mise de fonds.
+
+    cash_flows[0] doit être négatif (= mise de fonds initiale).
+    Retourne le TRI en décimal (ex: 0.12 = 12 %), ou NaN si pas de solution trouvée.
+    """
+    rate = 0.10  # point de départ : on suppose 10% de rendement
+    for _ in range(max_iter):
+        # VAN au taux courant
+        npv = sum(cf / (1 + rate) ** t for t, cf in enumerate(cash_flows))
+        # Dérivée de la VAN par rapport au taux (nécessaire pour Newton-Raphson)
+        dnpv = sum(-t * cf / (1 + rate) ** (t + 1) for t, cf in enumerate(cash_flows))
+        if abs(dnpv) < 1e-12:
+            break
+        new_rate = rate - npv / dnpv
+        if abs(new_rate - rate) < tol:
+            return new_rate
+        rate = new_rate
+    return float("nan")  # pas de solution convergente
+
+
+def build_cash_flows(building, cap_rate_sortie_pct, occupation_finale_pct):
+    """
+    Construit les flux de trésorerie annuels en fonds propres pour un immeuble.
+
+    Retourne une liste [CF_an0, CF_an1, ..., CF_anT] où :
+    - CF_an0 est négatif (mise de fonds initiale)
+    - CF_anT inclut le produit de cession de l'immeuble
+
+    Les paramètres cap_rate_sortie_pct et occupation_finale_pct permettent
+    de faire des simulations "et si..." sans modifier les données de base.
+    """
+    loyer = building["Loyer Annuel"]
+    cap_rate_achat = building["Cap Rate Achat"] / 100
+    ltv = building["LTV"] / 100
+    taux_interet = building["Taux Intérêt"] / 100
+    indexation = building["Indexation Loyers"] / 100
+    frais_expl_pct = building["Frais Exploitation"] / 100
+    travaux = building["Budget Travaux"]
+    duree = building["Durée Financement"]
+    cap_rate_sortie = cap_rate_sortie_pct / 100
+    occupation = occupation_finale_pct / 100
+
+    # Valeur d'acquisition et structure de financement
+    valeur_acquisition = loyer / cap_rate_achat
+    total_investissement = valeur_acquisition + travaux
+    dette = total_investissement * ltv
+    equity = total_investissement - dette  # apport en fonds propres (an 0)
+
+    # Mensualité constante — amortissement français (même formule que le reste de l'app)
+    r_m = taux_interet / 12  # taux mensuel
+    n = duree * 12           # nombre de mensualités
+    if r_m > 0:
+        mensualite = (dette * r_m) / (1 - (1 + r_m) ** (-n))
+    else:
+        mensualite = dette / n
+    service_annuel = mensualite * 12
+
+    # Construction des flux année par année
+    cash_flows = [-equity]  # an 0 : sortie de fonds propres (valeur négative)
+    for y in range(1, duree + 1):
+        # Le loyer croît chaque année avec l'indexation, modulé par le taux d'occupation
+        revenue_y = loyer * ((1 + indexation) ** y) * occupation
+        frais_y = revenue_y * frais_expl_pct
+        cf_y = revenue_y - frais_y - service_annuel  # flux opérationnel annuel
+        if y == duree:
+            # Dernière année : on ajoute le produit de cession
+            # (la dette est entièrement remboursée sur la durée, donc reste = 0 €)
+            revenu_final = loyer * ((1 + indexation) ** duree) * occupation
+            valeur_sortie = revenu_final / cap_rate_sortie
+            cf_y += valeur_sortie  # tout le produit revient aux fonds propres
+        cash_flows.append(cf_y)
+
+    return cash_flows
+
+
+def compute_sensitivity_grid(building, cap_rates, occupations):
+    """
+    Calcule le TRI (%) pour chaque combinaison de cap rate de sortie et taux d'occupation.
+
+    Retourne un tableau 2D numpy :
+    - lignes  = taux d'occupation (du plus bas au plus haut)
+    - colonnes = cap rate de sortie (du plus bas au plus haut)
+    """
+    grid = np.zeros((len(occupations), len(cap_rates)))
+    for i, occ in enumerate(occupations):
+        for j, cr in enumerate(cap_rates):
+            cfs = build_cash_flows(building, cr, occ)
+            irr = calculate_irr(cfs)
+            # Stocker en %, arrondi à 1 décimale
+            grid[i, j] = round(irr * 100, 1) if not np.isnan(irr) else np.nan
+    return grid
+
+
 # Sidebar form for inputs
 st.sidebar.header("Configurer les immeubles")
 with st.sidebar.form("building_form"):
@@ -297,6 +398,84 @@ if submitted and num_buildings > 0:
             file_name="resultats_portefeuille.csv",
             mime="text/csv"
         )
+
+        # ---- Analyse de sensibilité — TRI (IRR) ----
+        st.markdown("---")
+        st.subheader("Analyse de sensibilité — TRI (IRR)")
+
+        with st.expander("ℹ️ Qu'est-ce que le TRI (IRR) ?"):
+            st.markdown("""
+            Le **TRI (Taux de Rendement Interne)** — ou **IRR** en anglais (*Internal Rate of Return*) —
+            est le taux de rendement annualisé de votre mise de fonds.
+
+            **En pratique :**
+            - C'est le taux qui rend votre investissement "neutre" : les gains futurs,
+              ramenés à aujourd'hui, compensent exactement votre mise initiale.
+            - Si le TRI > coût d'emprunt → l'opération crée de la valeur.
+            - Si le TRI < coût d'emprunt → l'effet de levier joue contre vous.
+
+            **Standard européen (INREV / ILPA) :**
+            Le TRI et le multiple MOIC sont les deux métriques de référence pour
+            les fonds immobiliers en Europe — privilégiez-les face au simple rendement annuel.
+
+            **Comment lire la heatmap :**
+            - Chaque case montre le TRI (%) pour une combinaison hypothétique de
+              *cap rate de sortie* et *taux d'occupation final*.
+            - Cases **vertes** = meilleure rentabilité, cases **rouges** = moins bonne.
+            - Utile pour évaluer votre marge de sécurité : même si l'occupation baisse
+              ou si le marché se détend (cap rate plus élevé), le projet reste-t-il viable ?
+            """)
+
+        # Sélecteur d'immeuble (utile si plusieurs immeubles dans le portefeuille)
+        building_names = [b["Nom"] for b in st.session_state.building_data]
+        selected_name = st.selectbox(
+            "Immeuble à analyser",
+            building_names,
+            key="sensitivity_building",
+            help="Choisissez l'immeuble pour lequel afficher la heatmap de sensibilité."
+        )
+        selected_building = next(
+            b for b in st.session_state.building_data if b["Nom"] == selected_name
+        )
+
+        # Plages de variation pour les deux axes de la heatmap
+        cap_rates_range = np.arange(4.0, 9.5, 0.5)   # cap rate sortie : de 4 % à 9 %
+        occupations_range = np.arange(70, 105, 5)     # taux d'occupation : de 70 % à 100 %
+
+        # Calcul de la grille TRI
+        grid = compute_sensitivity_grid(selected_building, cap_rates_range, occupations_range)
+
+        # Tracé de la heatmap
+        fig_sens, ax_sens = plt.subplots(figsize=(12, 6))
+        sns.heatmap(
+            grid,
+            annot=True,         # afficher la valeur dans chaque case
+            fmt=".1f",          # 1 décimale
+            cmap="RdYlGn",      # rouge (mauvais) → jaune → vert (bon)
+            ax=ax_sens,
+            xticklabels=[f"{cr:.1f}%" for cr in cap_rates_range],
+            yticklabels=[f"{occ:.0f}%" for occ in occupations_range],
+            cbar_kws={"label": "TRI (%)"},
+            linewidths=0.5,
+            linecolor="lightgrey",
+        )
+        ax_sens.set_title(
+            f"TRI (%) — Cap Rate de Sortie × Taux d'Occupation Final\n{selected_name}",
+            fontsize=13,
+            pad=12,
+        )
+        ax_sens.set_xlabel("Cap Rate de Sortie (%)")
+        ax_sens.set_ylabel("Taux d'Occupation Final (%)")
+        plt.tight_layout()
+        st.pyplot(fig_sens)
+        plt.close(fig_sens)  # libérer la mémoire après affichage
+
+        st.caption(
+            "⚠️ *Estimation — la valeur d'actif est calculée par capitalisation du revenu "
+            "(cap rate), ce qui est une approximation simplifiée d'une valorisation "
+            "indépendante formelle au sens de l'AIFMD.*"
+        )
+
     else:
         st.error("Aucun résultat valide. Vérifiez les données saisies.")
 else:
